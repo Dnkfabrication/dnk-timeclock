@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0a0a0a">
+  <title>DnK Time Clock</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Barlow:wght@400;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <div id="topbar">
+      <span class="app-name">DnK Time Clock</span>
+      <button id="btn-settings" title="Settings">⚙</button>
+    </div>
+
+    <!-- MAIN CLOCK SCREEN -->
+    <div id="screen-main" class="screen active">
+      <div id="employee-bar">
+        <select id="employee-select"><option value="">— Select Employee —</option></select>
+      </div>
+      <div id="live-clock">00:00:00</div>
+      <div id="live-date">Monday, January 1</div>
+
+      <div id="action-area">
+        <button id="btn-primary" class="btn-primary" disabled>CLOCK IN</button>
+        <div id="lunch-row" class="hidden">
+          <button id="btn-lunch" class="btn-secondary">START LUNCH</button>
+          <span id="lunch-elapsed" class="elapsed-small"></span>
+        </div>
+        <div id="shift-elapsed" class="elapsed-main hidden">0:00:00</div>
+      </div>
+
+      <div id="day-summary" class="hidden">
+        <div class="summary-row"><span>Clocked in</span><span id="sum-clockin">—</span></div>
+        <div class="summary-row"><span>Lunch</span><span id="sum-lunch">—</span></div>
+        <div class="summary-row"><span>Hours worked</span><span id="sum-hours">—</span></div>
+      </div>
+    </div>
+
+    <!-- PAYROLL SCREEN -->
+    <div id="screen-payroll" class="screen hidden">
+      <h2 class="screen-title">WEEKLY PAYROLL</h2>
+      <div id="week-label"></div>
+      <div id="payroll-rows"></div>
+      <button id="btn-export-week" class="btn-primary">EXPORT WEEK TO SHEET</button>
+    </div>
+
+    <!-- SETTINGS PANEL (slide-in overlay) -->
+    <div id="settings-overlay"></div>
+    <div id="settings-panel" class="panel hidden">
+      <div class="panel-header">
+        <span>SETTINGS</span>
+        <button id="btn-settings-close">✕</button>
+      </div>
+
+      <section class="settings-section">
+        <h3>GOOGLE SHEETS</h3>
+        <label>Sheet ID</label>
+        <input id="input-sheet-id" type="text" placeholder="Paste your Sheet ID here">
+        <label>OAuth Client ID</label>
+        <input id="input-client-id" type="text" placeholder="Paste your OAuth Client ID here">
+        <button id="btn-google-signin" class="btn-secondary">SIGN IN WITH GOOGLE</button>
+        <div id="auth-status">Not connected — offline mode</div>
+        <button id="btn-sync" class="btn-outline hidden">SYNC OFFLINE PUNCHES</button>
+      </section>
+
+      <section class="settings-section">
+        <h3>EMPLOYEES</h3>
+        <div id="employee-list"></div>
+        <div class="add-employee-form">
+          <input id="input-emp-name" type="text" placeholder="Name">
+          <input id="input-emp-rate" type="number" placeholder="$/hr" step="0.01" min="0">
+          <input id="input-emp-deductions" type="number" placeholder="Weekly deductions $" step="0.01" min="0">
+          <button id="btn-add-employee" class="btn-secondary">ADD EMPLOYEE</button>
+        </div>
+      </section>
+    </div>
+
+    <!-- BOTTOM NAV -->
+    <nav id="bottom-nav">
+      <button class="nav-btn active" data-screen="main">CLOCK</button>
+      <button class="nav-btn" data-screen="payroll">PAYROLL</button>
+    </nav>
+  </div>
+
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
