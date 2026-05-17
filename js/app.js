@@ -21,6 +21,10 @@ const PUNCH_TYPES = {
 const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 const SHEETS_BASE  = 'https://sheets.googleapis.com/v4/spreadsheets';
 
+// ─── DEFAULT CREDENTIALS (pre-filled; user can override in Settings) ───────────
+const DEFAULT_CLIENT_ID = '587864224279-ni6hl6b8oedt5ctmvdptbtpl9al19nlr.apps.googleusercontent.com';
+const DEFAULT_SHEET_ID  = '1TO6MVIHFgUx-WRK07nTv-ygwY-VOoFkZSuJ9FWg0-8E';
+
 // ─── UUID HELPER ───────────────────────────────────────────────────────────────
 
 function uuid() {
@@ -63,8 +67,14 @@ function addPunch(employee, type, note = '') {
 }
 
 function getSettings() {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.SETTINGS) || '{}'); }
-  catch (e) { return {}; }
+  try {
+    const s = JSON.parse(localStorage.getItem(STORAGE_KEYS.SETTINGS) || '{}');
+    if (!s.clientId) s.clientId = DEFAULT_CLIENT_ID;
+    if (!s.sheetId)  s.sheetId  = DEFAULT_SHEET_ID;
+    return s;
+  } catch (e) {
+    return { clientId: DEFAULT_CLIENT_ID, sheetId: DEFAULT_SHEET_ID };
+  }
 }
 
 function saveSettings(s) {
