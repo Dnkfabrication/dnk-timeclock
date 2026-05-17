@@ -1,14 +1,12 @@
-// DnK Time Clock — app.js
-// Version 1.0.0
+// DnK Time Clock — app.js v2.0
+// Backend: Google Apps Script web app (no OAuth / no Google login required)
 
-const VERSION = '1.0.0';
+const VERSION = '2.0.0';
 
 const STORAGE_KEYS = {
   EMPLOYEES: 'dnk_employees',
   PUNCHES:   'dnk_punches',
-  SETTINGS:  'dnk_settings',
-  AUTH:      'dnk_auth',
-  CONV_HISTORY: 'dnk_conv'
+  SETTINGS:  'dnk_settings'
 };
 
 const PUNCH_TYPES = {
@@ -18,28 +16,22 @@ const PUNCH_TYPES = {
   CLOCK_OUT:   'CLOCK_OUT'
 };
 
-const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
-const SHEETS_BASE  = 'https://sheets.googleapis.com/v4/spreadsheets';
+// ─── ADMIN STATE (in-memory — resets on every page refresh) ───────────────────
+let adminUnlocked = false;
 
-// ─── DEFAULT CREDENTIALS (pre-filled; user can override in Settings) ───────────
-const DEFAULT_CLIENT_ID = '587864224279-ni6hl6b8oedt5ctmvdptbtpl9al19nlr.apps.googleusercontent.com';
-const DEFAULT_SHEET_ID  = '1TO6MVIHFgUx-WRK07nTv-ygwY-VOoFkZSuJ9FWg0-8E';
-
-// ─── UUID HELPER ───────────────────────────────────────────────────────────────
-
+// ─── UUID ──────────────────────────────────────────────────────────────────────
 function uuid() {
   return ([1e7] + -1e3 + -4e3 + -8e3 + -1e11).replace(/[018]/g, c =>
     (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
   );
 }
 
-// ─── STORAGE LAYER ─────────────────────────────────────────────────────────────
+// ─── STORAGE ──────────────────────────────────────────────────────────────────
 
 function getEmployees() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.EMPLOYEES) || '[]'); }
   catch (e) { return []; }
 }
-
 function saveEmployees(arr) {
   localStorage.setItem(STORAGE_KEYS.EMPLOYEES, JSON.stringify(arr));
 }
@@ -48,235 +40,138 @@ function getPunches() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.PUNCHES) || '[]'); }
   catch (e) { return []; }
 }
-
 function savePunches(arr) {
   localStorage.setItem(STORAGE_KEYS.PUNCHES, JSON.stringify(arr));
 }
 
 function addPunch(employee, type, note = '') {
-  const punches = getPunches();
-  punches.push({
+  const punch = {
     id:        uuid(),
     timestamp: new Date().toISOString(),
     employee,
     type,
     note,
     synced:    false
-  });
+  };
+  const punches = getPunches();
+  punches.push(punch);
   savePunches(punches);
+  return punch;
 }
 
 function getSettings() {
-  try {
-    const s = JSON.parse(localStorage.getItem(STORAGE_KEYS.SETTINGS) || '{}');
-    if (!s.clientId) s.clientId = DEFAULT_CLIENT_ID;
-    if (!s.sheetId)  s.sheetId  = DEFAULT_SHEET_ID;
-    return s;
-  } catch (e) {
-    return { clientId: DEFAULT_CLIENT_ID, sheetId: DEFAULT_SHEET_ID };
-  }
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.SETTINGS) || '{}'); }
+  catch (e) { return {}; }
 }
-
 function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(s));
 }
 
-function getAuth() {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.AUTH) || '{}'); }
-  catch (e) { return {}; }
+// ─── GAS SYNC ─────────────────────────────────────────────────────────────────
+// Uses text/plain content-type to avoid CORS preflight on GAS web app endpoints
+
+async function gasRequest(action, data) {
+  const { gasUrl } = getSettings();
+  if (!gasUrl) throw new Error('Apps Script URL not configured in Settings');
+  const resp = await fetch(gasUrl, {
+    method:  'POST',
+    headers: { 'Content-Type': 'text/plain' }, // avoids CORS preflight
+    body:    JSON.stringify({ action, data })
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const result = await resp.json();
+  if (!result.ok) throw new Error(result.error || 'GAS returned an error');
+  return result;
 }
 
-function saveAuth(a) {
-  localStorage.setItem(STORAGE_KEYS.AUTH, JSON.stringify(a));
+// Fire-and-forget single punch sync
+async function syncPunch(punch) {
+  try {
+    await gasRequest('punch', punch);
+    const punches = getPunches();
+    const idx = punches.findIndex(p => p.id === punch.id);
+    if (idx !== -1) { punches[idx].synced = true; savePunches(punches); }
+    checkOfflinePunches();
+  } catch (e) {
+    console.warn('Punch will sync later:', e.message);
+  }
 }
 
-// ─── AUTH ──────────────────────────────────────────────────────────────────────
-
-let tokenClient = null;
-
-function initAuth() {
-  const { clientId } = getSettings();
-  if (!clientId) return;
-  if (typeof google === 'undefined' || !google.accounts) {
-    // GIS not loaded yet — retry shortly
-    setTimeout(initAuth, 500);
+// Sync all unsynced punches at once
+async function syncBatchToGAS() {
+  const allPunches = getPunches();
+  const unsynced   = allPunches.filter(p => !p.synced);
+  if (!unsynced.length) {
+    updateSheetStatus('✓ All punches synced');
     return;
   }
-  tokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: clientId,
-    scope: SHEETS_SCOPE,
-    callback: (response) => {
-      if (response.error) {
-        updateAuthStatus(false, response.error);
-        return;
-      }
-      const expiry = Date.now() + (response.expires_in * 1000) - 60000;
-      saveAuth({ token: response.access_token, expiry });
-      updateAuthStatus(true);
-      syncOfflinePunches();
-    }
-  });
-}
-
-function getValidToken() {
-  const auth = getAuth();
-  if (auth.token && Date.now() < auth.expiry) return auth.token;
-  return null;
-}
-
-function isAuthenticated() {
-  return !!getValidToken();
-}
-
-function requestToken() {
-  if (!tokenClient) {
-    initAuth();
-    // If still not ready after initAuth, warn
-    if (!tokenClient) {
-      alert('Enter your OAuth Client ID in Settings first.');
-      return;
-    }
-  }
-  tokenClient.requestAccessToken();
-}
-
-function updateAuthStatus(connected, error = '') {
-  const el = document.getElementById('auth-status');
-  if (connected) {
-    el.textContent = '✓ Connected to Google Sheets';
-    el.className = 'connected';
-    document.getElementById('btn-sync').classList.add('hidden');
-  } else {
-    el.textContent = error ? `Error: ${error}` : 'Not connected — offline mode';
-    el.className = '';
+  const syncBtn = document.getElementById('btn-sync');
+  try {
+    if (syncBtn) { syncBtn.disabled = true; syncBtn.textContent = 'SYNCING…'; }
+    await gasRequest('punchBatch', unsynced);
+    const syncedIds = new Set(unsynced.map(p => p.id));
+    const updated   = getPunches().map(p => syncedIds.has(p.id) ? { ...p, synced: true } : p);
+    savePunches(updated);
+    updateSheetStatus('✓ All punches synced');
     checkOfflinePunches();
-  }
-  renderSettingsAuthState();
-}
-
-// ─── SHEETS API ────────────────────────────────────────────────────────────────
-
-async function sheetsRequest(method, path, body = null) {
-  const token = getValidToken();
-  if (!token) throw new Error('Not authenticated');
-  const { sheetId } = getSettings();
-  if (!sheetId) throw new Error('No Sheet ID configured');
-  const url = `${SHEETS_BASE}/${sheetId}${path}`;
-  const opts = {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json'
-    }
-  };
-  if (body) opts.body = JSON.stringify(body);
-  const resp = await fetch(url, opts);
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    throw new Error(err.error?.message || `HTTP ${resp.status}`);
-  }
-  return resp.json();
-}
-
-async function ensureSheetTabs() {
-  try {
-    const meta = await sheetsRequest('GET', '?fields=sheets.properties.title');
-    const existing = meta.sheets.map(s => s.properties.title);
-    const requests = [];
-    if (!existing.includes('Punches')) {
-      requests.push({ addSheet: { properties: { title: 'Punches' } } });
-    }
-    if (!existing.includes('Weekly')) {
-      requests.push({ addSheet: { properties: { title: 'Weekly' } } });
-    }
-    if (requests.length) {
-      await sheetsRequest('POST', ':batchUpdate', { requests });
-      if (!existing.includes('Punches')) {
-        await sheetsRequest(
-          'PUT',
-          '/values/Punches!A1:D1?valueInputOption=RAW',
-          { values: [['timestamp', 'employee', 'type', 'note']] }
-        );
-      }
-      if (!existing.includes('Weekly')) {
-        await sheetsRequest(
-          'PUT',
-          '/values/Weekly!A1:K1?valueInputOption=RAW',
-          { values: [['week_ending', 'employee', 'mon', 'tue', 'wed', 'thu', 'fri', 'total_hours', 'rate', 'deductions', 'gross', 'net']] }
-        );
-      }
-    }
   } catch (e) {
-    console.error('ensureSheetTabs:', e);
+    updateSheetStatus('Sync failed: ' + e.message, true);
+  } finally {
+    checkOfflinePunches(); // re-renders sync btn label
+    if (syncBtn) syncBtn.disabled = false;
   }
 }
 
-async function appendPunchToSheet(punch) {
-  const row = [punch.timestamp, punch.employee, punch.type, punch.note || ''];
-  await sheetsRequest(
-    'POST',
-    '/values/Punches!A:D:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS',
-    { values: [row] }
-  );
+function updateSheetStatus(msg, isError = false) {
+  const el = document.getElementById('sheet-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.className   = isError ? 'error' : (msg.startsWith('✓') ? 'connected' : '');
 }
 
-async function getTodayPunchesFromSheet(employee) {
-  const today = new Date().toISOString().slice(0, 10);
-  try {
-    const data = await sheetsRequest('GET', '/values/Punches!A:D');
-    const rows = data.values || [];
-    return rows.slice(1).filter(r => r[1] === employee && r[0].startsWith(today));
-  } catch (e) {
-    return [];
-  }
+// ─── ADMIN PIN ────────────────────────────────────────────────────────────────
+
+function promptPin(message) {
+  return new Promise(resolve => resolve(prompt(message)));
 }
 
-async function writeWeeklySummary(rows) {
-  const values = rows.map(r => [
-    r.week_ending,
-    r.employee,
-    r.mon,
-    r.tue,
-    r.wed,
-    r.thu,
-    r.fri,
-    r.totalHours,
-    r.rate,
-    r.deductions,
-    r.gross,
-    r.net
-  ]);
-  await sheetsRequest(
-    'POST',
-    '/values/Weekly!A:L:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS',
-    { values }
-  );
-}
+async function verifyAdminPin() {
+  if (adminUnlocked) return true;
 
-async function syncOfflinePunches() {
-  const allPunches = getPunches();
-  const unsynced = allPunches.filter(p => !p.synced);
-  if (!unsynced.length) return;
-  await ensureSheetTabs();
-  const updated = [...allPunches];
-  for (const p of unsynced) {
-    try {
-      await appendPunchToSheet(p);
-      const idx = updated.findIndex(u => u.id === p.id);
-      if (idx !== -1) updated[idx] = { ...updated[idx], synced: true };
-    } catch (e) {
-      console.error('sync error:', e);
-      break;
+  const s = getSettings();
+
+  if (!s.adminPin) {
+    // First launch — create a PIN
+    const pin1 = await promptPin('Create an admin PIN (numbers only, 4+ digits):');
+    if (!pin1 || !/^\d{4,}$/.test(pin1.trim())) {
+      alert('PIN must be at least 4 digits. Try again.');
+      return false;
     }
+    const pin2 = await promptPin('Confirm admin PIN:');
+    if (pin1.trim() !== pin2?.trim()) {
+      alert('PINs do not match. Try again.');
+      return false;
+    }
+    s.adminPin = pin1.trim();
+    saveSettings(s);
+    adminUnlocked = true;
+    return true;
   }
-  savePunches(updated);
-  checkOfflinePunches();
+
+  const entered = await promptPin('Enter admin PIN:');
+  if (entered === null) return false; // cancelled
+  if (entered.trim() !== s.adminPin) {
+    alert('Incorrect PIN.');
+    return false;
+  }
+  adminUnlocked = true;
+  return true;
 }
 
-// ─── STATE MACHINE ─────────────────────────────────────────────────────────────
+// ─── STATE MACHINE ────────────────────────────────────────────────────────────
 
 function getEmployeeStateToday(employeeName) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today   = new Date().toISOString().slice(0, 10);
   const punches = getPunches()
     .filter(p => p.employee === employeeName && p.timestamp.startsWith(today))
     .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
@@ -286,30 +181,22 @@ function getEmployeeStateToday(employeeName) {
 
   for (const p of punches) {
     if (p.type === PUNCH_TYPES.CLOCK_IN) {
-      state = 'clocked_in';
-      clockIn = p.timestamp;
-      // Reset these if clocking back in after clocking out (rare edge case)
-      lunchStart = null;
-      lunchEnd = null;
-      clockOut = null;
+      state = 'clocked_in'; clockIn = p.timestamp;
+      lunchStart = null; lunchEnd = null; clockOut = null;
     } else if (p.type === PUNCH_TYPES.LUNCH_START) {
-      state = 'on_lunch';
-      lunchStart = p.timestamp;
+      state = 'on_lunch'; lunchStart = p.timestamp;
     } else if (p.type === PUNCH_TYPES.LUNCH_END) {
-      state = 'clocked_in';
-      lunchEnd = p.timestamp;
+      state = 'clocked_in'; lunchEnd = p.timestamp;
     } else if (p.type === PUNCH_TYPES.CLOCK_OUT) {
-      state = 'clocked_out';
-      clockOut = p.timestamp;
+      state = 'clocked_out'; clockOut = p.timestamp;
     }
   }
-
   return { state, clockIn, lunchStart, lunchEnd, clockOut };
 }
 
 function calcElapsedSeconds(fromISO, toISO = null) {
   const from = new Date(fromISO).getTime();
-  const to = toISO ? new Date(toISO).getTime() : Date.now();
+  const to   = toISO ? new Date(toISO).getTime() : Date.now();
   return Math.max(0, Math.floor((to - from) / 1000));
 }
 
@@ -320,8 +207,7 @@ function calcLunchSeconds(lunchStart, lunchEnd) {
 
 function calcWorkedSeconds(st) {
   if (!st.clockIn) return 0;
-  const toTime = st.clockOut || null;
-  const total = calcElapsedSeconds(st.clockIn, toTime);
+  const total = calcElapsedSeconds(st.clockIn, st.clockOut || null);
   const lunch = calcLunchSeconds(st.lunchStart, st.lunchEnd);
   return Math.max(0, total - lunch);
 }
@@ -332,26 +218,22 @@ function formatSeconds(sec) {
   const s = sec % 60;
   return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
-
-function formatHours(sec) {
-  return (sec / 3600).toFixed(2);
-}
-
+function formatHours(sec) { return (sec / 3600).toFixed(2); }
 function formatTime(isoString) {
   if (!isoString) return '—';
   return new Date(isoString).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-// ─── PAYROLL ───────────────────────────────────────────────────────────────────
+// ─── PAYROLL ──────────────────────────────────────────────────────────────────
 
 function getWeekDates(referenceDate = new Date()) {
-  const d = new Date(referenceDate);
-  const day = d.getDay(); // 0=Sun, 1=Mon...
+  const d      = new Date(referenceDate);
+  const day    = d.getDay();
   const monday = new Date(d);
   monday.setDate(d.getDate() - (day === 0 ? 6 : day - 1));
   monday.setHours(0, 0, 0, 0);
 
-  const days = {};
+  const days  = {};
   const names = ['mon', 'tue', 'wed', 'thu', 'fri'];
   for (let i = 0; i < 5; i++) {
     const dd = new Date(monday);
@@ -366,76 +248,68 @@ function getWeekDates(referenceDate = new Date()) {
 
 function calcWeeklyPayroll() {
   const employees = getEmployees();
-  const week = getWeekDates();
-  const punches = getPunches();
-  const results = [];
+  const week      = getWeekDates();
+  const punches   = getPunches();
+  const results   = [];
 
   for (const emp of employees) {
     const dayHours = {};
     const dayNames = ['mon', 'tue', 'wed', 'thu', 'fri'];
 
     for (const dayName of dayNames) {
-      const dateStr = week[dayName];
+      const dateStr   = week[dayName];
       const dayPunches = punches
         .filter(p => p.employee === emp.name && p.timestamp.startsWith(dateStr))
         .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
       let clockIn = null, lunchStart = null, lunchEnd = null, clockOut = null;
       for (const p of dayPunches) {
-        if (p.type === 'CLOCK_IN') { clockIn = p.timestamp; lunchStart = null; lunchEnd = null; clockOut = null; }
-        else if (p.type === 'LUNCH_START') lunchStart = p.timestamp;
-        else if (p.type === 'LUNCH_END') lunchEnd = p.timestamp;
-        else if (p.type === 'CLOCK_OUT') clockOut = p.timestamp;
+        if      (p.type === 'CLOCK_IN')    { clockIn = p.timestamp; lunchStart = null; lunchEnd = null; clockOut = null; }
+        else if (p.type === 'LUNCH_START')   lunchStart = p.timestamp;
+        else if (p.type === 'LUNCH_END')     lunchEnd   = p.timestamp;
+        else if (p.type === 'CLOCK_OUT')     clockOut   = p.timestamp;
       }
 
-      if (!clockIn || !clockOut) {
-        dayHours[dayName] = 0;
-        continue;
-      }
-      const worked = calcWorkedSeconds({ clockIn, lunchStart, lunchEnd, clockOut });
-      dayHours[dayName] = parseFloat(formatHours(worked));
+      if (!clockIn || !clockOut) { dayHours[dayName] = 0; continue; }
+      dayHours[dayName] = parseFloat(formatHours(calcWorkedSeconds({ clockIn, lunchStart, lunchEnd, clockOut })));
     }
 
     const totalHours = Object.values(dayHours).reduce((a, b) => a + b, 0);
-    const rate = parseFloat(emp.rate) || 0;
+    const rate       = parseFloat(emp.rate)       || 0;
     const deductions = parseFloat(emp.deductions) || 0;
-    const gross = parseFloat((totalHours * rate).toFixed(2));
-    const net = parseFloat((gross - deductions).toFixed(2));
+    const gross      = parseFloat((totalHours * rate).toFixed(2));
+    const net        = parseFloat((gross - deductions).toFixed(2));
 
     results.push({
       employee:   emp.name,
-      rate,
-      deductions,
+      rate, deductions,
       ...dayHours,
       totalHours: parseFloat(totalHours.toFixed(2)),
-      gross,
-      net,
-      overtime:   totalHours > 40,
+      gross, net,
+      overtime:    totalHours > 40,
       week_ending: week.weekEnding
     });
   }
-
   return results;
 }
 
-// ─── UI RENDERING ──────────────────────────────────────────────────────────────
+// ─── UI RENDERING ─────────────────────────────────────────────────────────────
 
 function renderEmployeeSelect() {
-  const sel = document.getElementById('employee-select');
+  const sel     = document.getElementById('employee-select');
   const current = sel.value;
   sel.innerHTML = '<option value="">— Select Employee —</option>';
   getEmployees().forEach(e => {
     const opt = document.createElement('option');
-    opt.value = e.name;
-    opt.textContent = e.name;
+    opt.value = e.name; opt.textContent = e.name;
     sel.appendChild(opt);
   });
   if (current) sel.value = current;
 }
 
 function renderEmployeeList() {
-  const list = document.getElementById('employee-list');
-  list.innerHTML = '';
+  const list      = document.getElementById('employee-list');
+  list.innerHTML  = '';
   const employees = getEmployees();
   if (!employees.length) {
     list.innerHTML = '<p style="font-family:var(--font-label);font-size:13px;color:var(--text-muted);padding:8px 0">No employees yet.</p>';
@@ -464,62 +338,53 @@ function renderEmployeeList() {
 }
 
 function renderMainScreen() {
-  const empName = document.getElementById('employee-select').value;
-  const btn = document.getElementById('btn-primary');
-  const lunchRow = document.getElementById('lunch-row');
-  const shiftElapsed = document.getElementById('shift-elapsed');
+  const empName    = document.getElementById('employee-select').value;
+  const btn        = document.getElementById('btn-primary');
+  const lunchRow   = document.getElementById('lunch-row');
+  const shiftEl    = document.getElementById('shift-elapsed');
   const daySummary = document.getElementById('day-summary');
 
   if (!empName) {
-    btn.disabled = true;
-    btn.textContent = 'CLOCK IN';
-    btn.className = 'btn-primary';
+    btn.disabled = true; btn.textContent = 'CLOCK IN'; btn.className = 'btn-primary';
     lunchRow.classList.add('hidden');
-    shiftElapsed.classList.add('hidden');
+    shiftEl.classList.add('hidden');
     daySummary.classList.add('hidden');
     return;
   }
 
-  const st = getEmployeeStateToday(empName);
+  const st  = getEmployeeStateToday(empName);
   btn.disabled = false;
 
   if (st.state === 'idle') {
-    btn.textContent = 'CLOCK IN';
-    btn.className = 'btn-primary';
+    btn.textContent = 'CLOCK IN'; btn.className = 'btn-primary';
     lunchRow.classList.add('hidden');
-    shiftElapsed.classList.add('hidden');
+    shiftEl.classList.add('hidden');
     daySummary.classList.add('hidden');
 
   } else if (st.state === 'clocked_in') {
-    btn.textContent = 'CLOCK OUT';
-    btn.className = 'btn-primary clocked-in';
-    btn.disabled = false;
+    btn.textContent = 'CLOCK OUT'; btn.className = 'btn-primary clocked-in';
     lunchRow.classList.remove('hidden');
     document.getElementById('btn-lunch').textContent = 'START LUNCH';
-    shiftElapsed.classList.remove('hidden');
-    shiftElapsed.style.color = 'var(--orange)';
-    shiftElapsed.classList.remove('paused');
+    shiftEl.classList.remove('hidden');
+    shiftEl.style.color = 'var(--orange)';
+    shiftEl.classList.remove('paused');
     renderDaySummary(st);
     daySummary.classList.remove('hidden');
 
   } else if (st.state === 'on_lunch') {
-    btn.textContent = 'CLOCK OUT';
-    btn.className = 'btn-primary clocked-in';
-    btn.disabled = true; // can't clock out during lunch
+    btn.textContent = 'CLOCK OUT'; btn.className = 'btn-primary clocked-in'; btn.disabled = true;
     lunchRow.classList.remove('hidden');
     document.getElementById('btn-lunch').textContent = 'END LUNCH';
-    shiftElapsed.classList.remove('hidden');
-    shiftElapsed.style.color = 'var(--text-muted)';
-    shiftElapsed.classList.add('paused');
+    shiftEl.classList.remove('hidden');
+    shiftEl.style.color = 'var(--text-muted)';
+    shiftEl.classList.add('paused');
     renderDaySummary(st);
     daySummary.classList.remove('hidden');
 
   } else if (st.state === 'clocked_out') {
-    btn.textContent = 'CLOCKED OUT';
-    btn.className = 'btn-primary';
-    btn.disabled = true;
+    btn.textContent = 'CLOCKED OUT'; btn.className = 'btn-primary'; btn.disabled = true;
     lunchRow.classList.add('hidden');
-    shiftElapsed.classList.add('hidden');
+    shiftEl.classList.add('hidden');
     renderDaySummary(st);
     daySummary.classList.remove('hidden');
   }
@@ -529,9 +394,9 @@ function renderDaySummary(st) {
   document.getElementById('sum-clockin').textContent = formatTime(st.clockIn);
   const lunchSec = calcLunchSeconds(st.lunchStart, st.lunchEnd);
   document.getElementById('sum-lunch').textContent = lunchSec > 0 ? formatSeconds(lunchSec) : '—';
-  const effectiveClockOut = st.clockOut || new Date().toISOString();
-  const worked = calcWorkedSeconds({ ...st, clockOut: effectiveClockOut });
-  document.getElementById('sum-hours').textContent = formatHours(worked) + ' hrs';
+  const effectiveOut = st.clockOut || new Date().toISOString();
+  document.getElementById('sum-hours').textContent =
+    formatHours(calcWorkedSeconds({ ...st, clockOut: effectiveOut })) + ' hrs';
 }
 
 function renderPayrollScreen() {
@@ -546,7 +411,6 @@ function renderPayrollScreen() {
     container.innerHTML = '<p style="color:var(--text-muted);font-family:var(--font-label);padding:16px 0">No employees configured. Add employees in Settings.</p>';
     return;
   }
-
   rows.forEach(r => {
     const card = document.createElement('div');
     card.className = 'payroll-card';
@@ -569,38 +433,37 @@ function renderPayrollScreen() {
 }
 
 function renderSettingsValues() {
-  const s = getSettings();
-  document.getElementById('input-sheet-id').value = s.sheetId || '';
-  document.getElementById('input-client-id').value = s.clientId || '';
-  // Reflect current auth state
-  if (isAuthenticated()) {
-    updateAuthStatus(true);
-  }
-}
+  const s       = getSettings();
+  document.getElementById('input-gas-url').value = s.gasUrl || '';
 
-function renderSettingsAuthState() {
-  const connected = isAuthenticated();
-  if (!connected) {
-    checkOfflinePunches();
+  const unsynced = getPunches().filter(p => !p.synced).length;
+  if (!s.gasUrl) {
+    updateSheetStatus('Not configured — punches saved locally');
+  } else if (unsynced > 0) {
+    updateSheetStatus(`${unsynced} punch${unsynced > 1 ? 'es' : ''} pending sync`);
+  } else {
+    updateSheetStatus('✓ All punches synced');
   }
 }
 
 function checkOfflinePunches() {
   const unsynced = getPunches().filter(p => !p.synced).length;
-  const syncBtn = document.getElementById('btn-sync');
-  const gearBtn = document.getElementById('btn-settings');
+  const syncBtn  = document.getElementById('btn-sync');
+  const gearBtn  = document.getElementById('btn-settings');
 
-  if (unsynced > 0 && !isAuthenticated()) {
-    syncBtn.classList.remove('hidden');
-    syncBtn.textContent = `SYNC ${unsynced} OFFLINE PUNCH${unsynced > 1 ? 'ES' : ''}`;
+  if (unsynced > 0) {
+    if (syncBtn) {
+      syncBtn.classList.remove('hidden');
+      syncBtn.textContent = `SYNC ${unsynced} OFFLINE PUNCH${unsynced > 1 ? 'ES' : ''}`;
+    }
     gearBtn.classList.add('has-pending');
   } else {
-    syncBtn.classList.add('hidden');
+    if (syncBtn) syncBtn.classList.add('hidden');
     gearBtn.classList.remove('has-pending');
   }
 }
 
-// ─── TIMER LOOP ────────────────────────────────────────────────────────────────
+// ─── TIMER ────────────────────────────────────────────────────────────────────
 
 let timerInterval = null;
 
@@ -611,31 +474,24 @@ function startTimer() {
 }
 
 function tick() {
-  // Live clock
   const now = new Date();
   document.getElementById('live-clock').textContent =
     now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
   document.getElementById('live-date').textContent =
     now.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' });
 
-  // Shift elapsed
   const empName = document.getElementById('employee-select').value;
   if (!empName) return;
 
-  const st = getEmployeeStateToday(empName);
+  const st      = getEmployeeStateToday(empName);
   const elapsedEl = document.getElementById('shift-elapsed');
 
   if (st.state === 'clocked_in') {
     elapsedEl.textContent = formatSeconds(calcWorkedSeconds(st));
-  } else if (st.state === 'on_lunch') {
-    // Show time worked before lunch started (paused)
-    if (st.clockIn && st.lunchStart) {
-      const workedBeforeLunch = calcElapsedSeconds(st.clockIn, st.lunchStart);
-      elapsedEl.textContent = formatSeconds(workedBeforeLunch) + ' ⏸';
-    }
+  } else if (st.state === 'on_lunch' && st.clockIn && st.lunchStart) {
+    elapsedEl.textContent = formatSeconds(calcElapsedSeconds(st.clockIn, st.lunchStart)) + ' ⏸';
   }
 
-  // Lunch elapsed counter
   if (st.state === 'on_lunch' && st.lunchStart) {
     document.getElementById('lunch-elapsed').textContent =
       formatSeconds(calcElapsedSeconds(st.lunchStart));
@@ -643,38 +499,23 @@ function tick() {
     document.getElementById('lunch-elapsed').textContent = '';
   }
 
-  // Update day summary live while clocked in or on lunch
-  if (st.state === 'clocked_in' || st.state === 'on_lunch') {
-    renderDaySummary(st);
-  }
+  if (st.state === 'clocked_in' || st.state === 'on_lunch') renderDaySummary(st);
 }
 
-// ─── EVENT HANDLERS ────────────────────────────────────────────────────────────
+// ─── EVENT HANDLERS ───────────────────────────────────────────────────────────
 
 async function handlePrimaryButton() {
   const empName = document.getElementById('employee-select').value;
   if (!empName) return;
   const st = getEmployeeStateToday(empName);
   let type;
-  if (st.state === 'idle') type = PUNCH_TYPES.CLOCK_IN;
+  if      (st.state === 'idle')      type = PUNCH_TYPES.CLOCK_IN;
   else if (st.state === 'clocked_in') type = PUNCH_TYPES.CLOCK_OUT;
   else return;
 
-  addPunch(empName, type);
+  const punch = addPunch(empName, type);
   renderMainScreen();
-
-  // Async sync to sheets
-  if (isAuthenticated()) {
-    try {
-      const allPunches = getPunches();
-      const lastPunch = allPunches[allPunches.length - 1];
-      await appendPunchToSheet(lastPunch);
-      allPunches[allPunches.length - 1].synced = true;
-      savePunches(allPunches);
-    } catch (e) {
-      console.error('sheet sync error:', e);
-    }
-  }
+  syncPunch(punch); // fire-and-forget
   checkOfflinePunches();
 }
 
@@ -683,49 +524,32 @@ async function handleLunchButton() {
   if (!empName) return;
   const st = getEmployeeStateToday(empName);
   let type;
-  if (st.state === 'clocked_in') type = PUNCH_TYPES.LUNCH_START;
-  else if (st.state === 'on_lunch') type = PUNCH_TYPES.LUNCH_END;
+  if      (st.state === 'clocked_in') type = PUNCH_TYPES.LUNCH_START;
+  else if (st.state === 'on_lunch')   type = PUNCH_TYPES.LUNCH_END;
   else return;
 
-  addPunch(empName, type);
+  const punch = addPunch(empName, type);
   renderMainScreen();
-
-  if (isAuthenticated()) {
-    try {
-      const allPunches = getPunches();
-      const lastPunch = allPunches[allPunches.length - 1];
-      await appendPunchToSheet(lastPunch);
-      allPunches[allPunches.length - 1].synced = true;
-      savePunches(allPunches);
-    } catch (e) {
-      console.error('sheet sync error:', e);
-    }
-  }
+  syncPunch(punch); // fire-and-forget
   checkOfflinePunches();
 }
 
 async function handleExportWeek() {
   const rows = calcWeeklyPayroll();
-  if (!rows.length) {
-    alert('No payroll data to export.');
-    return;
-  }
-  if (!isAuthenticated()) {
-    alert('Sign in with Google first to export to Sheets.');
-    return;
-  }
+  if (!rows.length) { alert('No payroll data to export.'); return; }
+
+  const { gasUrl } = getSettings();
+  if (!gasUrl) { alert('Configure the Apps Script URL in Settings first.'); return; }
+
   const btn = document.getElementById('btn-export-week');
-  btn.disabled = true;
-  btn.textContent = 'EXPORTING...';
+  btn.disabled = true; btn.textContent = 'EXPORTING…';
   try {
-    await ensureSheetTabs();
-    await writeWeeklySummary(rows);
+    await gasRequest('exportWeek', rows);
     alert('Week exported to Google Sheets!');
   } catch (e) {
     alert('Export failed: ' + e.message);
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'EXPORT WEEK TO SHEET';
+    btn.disabled = false; btn.textContent = 'EXPORT WEEK TO SHEET';
   }
 }
 
@@ -735,20 +559,20 @@ function switchScreen(name) {
     s.classList.add('hidden');
   });
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
-
   const screenEl = document.getElementById(`screen-${name}`);
   screenEl.classList.remove('hidden');
   screenEl.classList.add('active');
   document.querySelector(`[data-screen="${name}"]`).classList.add('active');
-
   if (name === 'payroll') renderPayrollScreen();
 }
 
-function openSettings() {
+async function openSettings() {
+  const ok = await verifyAdminPin();
+  if (!ok) return;
+
   const panel = document.getElementById('settings-panel');
   panel.classList.remove('hidden');
-  // Force reflow so transition fires
-  panel.offsetHeight; // eslint-disable-line no-unused-expressions
+  panel.offsetHeight; // force reflow for CSS transition
   panel.classList.add('open');
   document.getElementById('settings-overlay').classList.add('open');
   renderSettingsValues();
@@ -760,81 +584,70 @@ function closeSettings() {
   document.getElementById('settings-overlay').classList.remove('open');
 }
 
-// ─── INIT ──────────────────────────────────────────────────────────────────────
+// ─── INIT ─────────────────────────────────────────────────────────────────────
 
 function init() {
-  // Try to init auth (will retry if GIS not loaded yet)
-  initAuth();
-
-  // Render initial state
   renderEmployeeSelect();
   renderMainScreen();
   startTimer();
   checkOfflinePunches();
-  renderSettingsAuthState();
 
   // Highlight payroll tab on Fridays
   if (new Date().getDay() === 5) {
-    const payrollBtn = document.querySelector('[data-screen="payroll"]');
-    payrollBtn.classList.add('friday-badge');
+    document.querySelector('[data-screen="payroll"]').classList.add('friday-badge');
   }
 
-  // ── Employee select ──
-  document.getElementById('employee-select').addEventListener('change', () => {
-    renderMainScreen();
-  });
+  // Employee select
+  document.getElementById('employee-select').addEventListener('change', renderMainScreen);
 
-  // ── Clock In/Out ──
+  // Clock in / out
   document.getElementById('btn-primary').addEventListener('click', handlePrimaryButton);
 
-  // ── Lunch ──
+  // Lunch
   document.getElementById('btn-lunch').addEventListener('click', handleLunchButton);
 
-  // ── Settings open/close ──
+  // Settings open / close
   document.getElementById('btn-settings').addEventListener('click', openSettings);
   document.getElementById('btn-settings-close').addEventListener('click', closeSettings);
   document.getElementById('settings-overlay').addEventListener('click', closeSettings);
 
-  // ── Bottom nav ──
+  // Bottom nav
   document.querySelectorAll('.nav-btn').forEach(btn => {
     btn.addEventListener('click', () => switchScreen(btn.dataset.screen));
   });
 
-  // ── Settings inputs — save on change ──
-  document.getElementById('input-sheet-id').addEventListener('change', e => {
-    const s = getSettings();
-    s.sheetId = e.target.value.trim();
+  // GAS URL input
+  document.getElementById('input-gas-url').addEventListener('change', e => {
+    const s  = getSettings();
+    s.gasUrl = e.target.value.trim();
     saveSettings(s);
+    renderSettingsValues();
   });
 
-  document.getElementById('input-client-id').addEventListener('change', e => {
-    const s = getSettings();
-    s.clientId = e.target.value.trim();
-    saveSettings(s);
-    initAuth(); // Re-initialize with new client ID
-  });
+  // Sync offline punches
+  document.getElementById('btn-sync').addEventListener('click', syncBatchToGAS);
 
-  // ── Google sign-in ──
-  document.getElementById('btn-google-signin').addEventListener('click', requestToken);
-
-  // ── Sync offline punches ──
-  document.getElementById('btn-sync').addEventListener('click', () => {
-    if (!isAuthenticated()) {
-      requestToken(); // Will auto-sync after auth callback
-    } else {
-      syncOfflinePunches();
-    }
-  });
-
-  // ── Add employee ──
-  document.getElementById('btn-add-employee').addEventListener('click', () => {
-    const name = document.getElementById('input-emp-name').value.trim();
-    const rate = parseFloat(document.getElementById('input-emp-rate').value) || 0;
-    const deductions = parseFloat(document.getElementById('input-emp-deductions').value) || 0;
-    if (!name) {
-      alert('Enter an employee name.');
+  // Change PIN
+  document.getElementById('btn-change-pin').addEventListener('click', async () => {
+    const newPin = await promptPin('Enter new admin PIN (4+ digits):');
+    if (!newPin || !/^\d{4,}$/.test(newPin.trim())) {
+      alert('PIN must be at least 4 digits.');
       return;
     }
+    const confirm = await promptPin('Confirm new PIN:');
+    if (newPin.trim() !== confirm?.trim()) { alert('PINs do not match.'); return; }
+    const s   = getSettings();
+    s.adminPin = newPin.trim();
+    saveSettings(s);
+    alert('Admin PIN updated.');
+  });
+
+  // Add employee
+  document.getElementById('btn-add-employee').addEventListener('click', () => {
+    const name       = document.getElementById('input-emp-name').value.trim();
+    const rate       = parseFloat(document.getElementById('input-emp-rate').value)       || 0;
+    const deductions = parseFloat(document.getElementById('input-emp-deductions').value) || 0;
+    if (!name) { alert('Enter an employee name.'); return; }
     const emps = getEmployees();
     if (emps.find(e => e.name.toLowerCase() === name.toLowerCase())) {
       alert('An employee with that name already exists.');
@@ -844,19 +657,17 @@ function init() {
     saveEmployees(emps);
     renderEmployeeList();
     renderEmployeeSelect();
-    // Clear form
-    document.getElementById('input-emp-name').value = '';
-    document.getElementById('input-emp-rate').value = '';
+    document.getElementById('input-emp-name').value    = '';
+    document.getElementById('input-emp-rate').value    = '';
     document.getElementById('input-emp-deductions').value = '';
     document.getElementById('input-emp-name').focus();
   });
 
-  // Allow pressing Enter in name field to submit
   document.getElementById('input-emp-name').addEventListener('keydown', e => {
     if (e.key === 'Enter') document.getElementById('btn-add-employee').click();
   });
 
-  // ── Export week ──
+  // Export week
   document.getElementById('btn-export-week').addEventListener('click', handleExportWeek);
 }
 

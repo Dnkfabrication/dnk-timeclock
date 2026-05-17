@@ -61,13 +61,15 @@
 
       <section class="settings-section">
         <h3>GOOGLE SHEETS</h3>
-        <label>Sheet ID</label>
-        <input id="input-sheet-id" type="text" placeholder="Paste your Sheet ID here">
-        <label>OAuth Client ID</label>
-        <input id="input-client-id" type="text" placeholder="Paste your OAuth Client ID here">
-        <button id="btn-google-signin" class="btn-secondary">SIGN IN WITH GOOGLE</button>
-        <div id="auth-status">Not connected — offline mode</div>
+        <label>Apps Script URL</label>
+        <input id="input-gas-url" type="text" placeholder="Paste your GAS Web App URL here">
+        <div id="sheet-status">Not configured — punches saved locally</div>
         <button id="btn-sync" class="btn-outline hidden">SYNC OFFLINE PUNCHES</button>
+      </section>
+
+      <section class="settings-section">
+        <h3>ADMIN PIN</h3>
+        <button id="btn-change-pin" class="btn-secondary">CHANGE PIN</button>
       </section>
 
       <section class="settings-section">
@@ -89,7 +91,6 @@
     </nav>
   </div>
 
-  <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script src="js/app.js"></script>
 </body>
 </html>
