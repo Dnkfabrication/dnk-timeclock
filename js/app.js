@@ -1,7 +1,7 @@
-// DnK Time Clock — app.js v2.1
+// DnK Time Clock — app.js v2.2
 // Backend: Google Apps Script web app (no OAuth / no Google login required)
 
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 
 // Apps Script web-app endpoint — the single source of truth.
 // Hardcoded so the app can never drift to a stale or wrong deployment URL.
@@ -578,6 +578,242 @@ function closeSettings() {
   document.getElementById('settings-overlay').classList.remove('open');
 }
 
+// ─── TIMESHEET EDITOR (admin) ─────────────────────────────────────────────────
+
+const PUNCH_TYPE_LABELS = {
+  CLOCK_IN:    'Clock In',
+  CLOCK_OUT:   'Clock Out',
+  LUNCH_START: 'Lunch Start',
+  LUNCH_END:   'Lunch End'
+};
+
+let tsWeekRef = new Date();   // any date within the week being viewed
+let tsEditId  = null;         // id of the punch currently in inline-edit mode
+
+// Monday 00:00 → Sunday 23:59:59.999 around refDate, in local time
+function tsWeekRange(refDate) {
+  const d      = new Date(refDate);
+  const day    = d.getDay();
+  const monday = new Date(d);
+  monday.setDate(d.getDate() - (day === 0 ? 6 : day - 1));
+  monday.setHours(0, 0, 0, 0);
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+  sunday.setHours(23, 59, 59, 999);
+  return { monday, sunday };
+}
+
+// ISO instant → value for <input type="datetime-local"> in local wall time
+function isoToLocalInput(iso) {
+  const d = new Date(iso);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}` +
+         `T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function openTimesheet() {
+  closeSettings();
+  tsWeekRef = new Date();
+  tsEditId  = null;
+  document.getElementById('ts-add-datetime').value = isoToLocalInput(new Date().toISOString());
+  document.getElementById('ts-add-type').value = 'CLOCK_IN';
+
+  const panel = document.getElementById('timesheet-panel');
+  panel.classList.remove('hidden');
+  panel.offsetHeight; // reflow for transition
+  panel.classList.add('open');
+  document.getElementById('timesheet-overlay').classList.add('open');
+  renderTimesheet();
+}
+
+function closeTimesheet() {
+  document.getElementById('timesheet-panel').classList.remove('open');
+  document.getElementById('timesheet-overlay').classList.remove('open');
+  tsEditId = null;
+}
+
+function renderTimesheet() {
+  // Employee dropdown
+  const sel       = document.getElementById('ts-employee');
+  const current   = sel.value;
+  const employees = getEmployees();
+  sel.innerHTML = '<option value="">— Select Employee —</option>';
+  employees.forEach(e => {
+    const opt = document.createElement('option');
+    opt.value = e.name; opt.textContent = e.name;
+    sel.appendChild(opt);
+  });
+  if (current)               sel.value = current;
+  else if (employees.length) sel.value = employees[0].name;
+
+  // Week label
+  const { monday, sunday } = tsWeekRange(tsWeekRef);
+  const fmt = d => d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  document.getElementById('ts-week-label').textContent = `${fmt(monday)} – ${fmt(sunday)}`;
+
+  renderTimesheetPunchList();
+}
+
+function renderTimesheetPunchList() {
+  const list = document.getElementById('ts-punch-list');
+  list.innerHTML = '';
+
+  const empName = document.getElementById('ts-employee').value;
+  if (!empName) {
+    list.innerHTML = '<p class="ts-empty">Select an employee to see punches.</p>';
+    return;
+  }
+
+  const { monday, sunday } = tsWeekRange(tsWeekRef);
+  const punches = getPunches()
+    .filter(p => p.employee === empName)
+    .filter(p => { const t = new Date(p.timestamp); return t >= monday && t <= sunday; })
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
+  if (!punches.length) {
+    list.innerHTML = '<p class="ts-empty">No punches this week.</p>';
+    return;
+  }
+
+  let lastDay = '';
+  punches.forEach(p => {
+    const d      = new Date(p.timestamp);
+    const dayKey = d.toDateString();
+    if (dayKey !== lastDay) {
+      lastDay = dayKey;
+      const h = document.createElement('div');
+      h.className   = 'ts-day-head';
+      h.textContent = d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+      list.appendChild(h);
+    }
+    list.appendChild(p.id === tsEditId ? buildPunchEditRow(p) : buildPunchRow(p));
+  });
+}
+
+function buildPunchRow(p) {
+  const row = document.createElement('div');
+  row.className = 'ts-punch-row';
+  const time = new Date(p.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  row.innerHTML = `
+    <span class="ts-punch-time">${time}</span>
+    <span class="ts-punch-type">${PUNCH_TYPE_LABELS[p.type] || p.type}</span>
+    <button class="ts-icon-btn" data-act="edit">EDIT</button>
+    <button class="ts-icon-btn" data-act="del">✕</button>
+  `;
+  row.querySelector('[data-act="edit"]').addEventListener('click', () => {
+    tsEditId = p.id;
+    renderTimesheetPunchList();
+  });
+  row.querySelector('[data-act="del"]').addEventListener('click', () => tsDeletePunch(p.id));
+  return row;
+}
+
+function buildPunchEditRow(p) {
+  const row = document.createElement('div');
+  row.className = 'ts-punch-edit';
+  const typeOpts = Object.keys(PUNCH_TYPE_LABELS).map(t =>
+    `<option value="${t}" ${t === p.type ? 'selected' : ''}>${PUNCH_TYPE_LABELS[t]}</option>`
+  ).join('');
+  row.innerHTML = `
+    <input type="datetime-local" class="ts-edit-dt" value="${isoToLocalInput(p.timestamp)}">
+    <select class="ts-edit-type">${typeOpts}</select>
+    <div class="ts-edit-actions">
+      <button class="ts-icon-btn" data-act="save">SAVE</button>
+      <button class="ts-icon-btn" data-act="cancel">CANCEL</button>
+    </div>
+  `;
+  row.querySelector('[data-act="cancel"]').addEventListener('click', () => {
+    tsEditId = null;
+    renderTimesheetPunchList();
+  });
+  row.querySelector('[data-act="save"]').addEventListener('click', () => {
+    const dtVal = row.querySelector('.ts-edit-dt').value;
+    const type  = row.querySelector('.ts-edit-type').value;
+    if (!dtVal) { alert('Pick a date and time.'); return; }
+    tsSavePunchEdit(p.id, new Date(dtVal).toISOString(), type);
+  });
+  return row;
+}
+
+function tsSavePunchEdit(id, isoTimestamp, type) {
+  const punches = getPunches();
+  const idx = punches.findIndex(p => p.id === id);
+  if (idx === -1) return;
+  punches[idx].timestamp = isoTimestamp;
+  punches[idx].type      = type;
+  punches[idx].synced    = false;
+  savePunches(punches);
+  tsEditId = null;
+  tsAfterChange();
+  pushPunchToSheet(punches[idx]);
+}
+
+function tsDeletePunch(id) {
+  const punches = getPunches();
+  const punch   = punches.find(p => p.id === id);
+  if (!punch) return;
+  const when = new Date(punch.timestamp).toLocaleString();
+  if (!confirm(`Delete this punch?\n\n${PUNCH_TYPE_LABELS[punch.type] || punch.type} — ${when}`)) return;
+  savePunches(punches.filter(p => p.id !== id));
+  tsAfterChange();
+  deletePunchFromSheet(punch);
+}
+
+function tsAddPunch() {
+  const empName = document.getElementById('ts-employee').value;
+  if (!empName) { alert('Select an employee first.'); return; }
+  const dtVal = document.getElementById('ts-add-datetime').value;
+  const type  = document.getElementById('ts-add-type').value;
+  if (!dtVal) { alert('Pick a date and time for the punch.'); return; }
+
+  const punch = {
+    id:        uuid(),
+    timestamp: new Date(dtVal).toISOString(),
+    employee:  empName,
+    type,
+    note:      'manual entry',
+    synced:    false
+  };
+  const punches = getPunches();
+  punches.push(punch);
+  savePunches(punches);
+
+  // Jump the viewed week to the new punch's week so it appears in the list
+  tsWeekRef = new Date(punch.timestamp);
+  tsAfterChange();
+  pushPunchToSheet(punch);
+}
+
+// Re-render anything that depends on punch data
+function tsAfterChange() {
+  renderTimesheet();
+  renderMainScreen();
+  checkOfflinePunches();
+  if (document.getElementById('screen-payroll').classList.contains('active')) {
+    renderPayrollScreen();
+  }
+}
+
+async function pushPunchToSheet(punch) {
+  try {
+    await gasRequest('updatePunch', punch);
+    const punches = getPunches();
+    const idx = punches.findIndex(p => p.id === punch.id);
+    if (idx !== -1) { punches[idx].synced = true; savePunches(punches); }
+    checkOfflinePunches();
+  } catch (e) {
+    console.warn('Punch saved locally; will sync later:', e.message);
+  }
+}
+
+async function deletePunchFromSheet(punch) {
+  try {
+    await gasRequest('deletePunch', { id: punch.id });
+  } catch (e) {
+    console.warn('Punch removed locally; sheet row remains:', e.message);
+  }
+}
+
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 
 function init() {
@@ -655,6 +891,26 @@ function init() {
 
   // Export week
   document.getElementById('btn-export-week').addEventListener('click', handleExportWeek);
+
+  // Edit Timesheet panel
+  document.getElementById('btn-open-timesheet').addEventListener('click', openTimesheet);
+  document.getElementById('btn-timesheet-close').addEventListener('click', closeTimesheet);
+  document.getElementById('timesheet-overlay').addEventListener('click', closeTimesheet);
+  document.getElementById('ts-employee').addEventListener('change', () => {
+    tsEditId = null;
+    renderTimesheetPunchList();
+  });
+  document.getElementById('ts-week-prev').addEventListener('click', () => {
+    tsWeekRef.setDate(tsWeekRef.getDate() - 7);
+    tsEditId = null;
+    renderTimesheet();
+  });
+  document.getElementById('ts-week-next').addEventListener('click', () => {
+    tsWeekRef.setDate(tsWeekRef.getDate() + 7);
+    tsEditId = null;
+    renderTimesheet();
+  });
+  document.getElementById('ts-add-btn').addEventListener('click', tsAddPunch);
 }
 
 document.addEventListener('DOMContentLoaded', init);

@@ -66,6 +66,11 @@
       </section>
 
       <section class="settings-section">
+        <h3>TIMESHEET</h3>
+        <button id="btn-open-timesheet" class="btn-secondary">EDIT TIMESHEET</button>
+      </section>
+
+      <section class="settings-section">
         <h3>ADMIN PIN</h3>
         <button id="btn-change-pin" class="btn-secondary">CHANGE PIN</button>
       </section>
@@ -79,6 +84,48 @@
           <input id="input-emp-deductions" type="number" placeholder="Weekly deductions $" step="0.01" min="0">
           <button id="btn-add-employee" class="btn-secondary">ADD EMPLOYEE</button>
         </div>
+      </section>
+    </div>
+
+    <!-- EDIT TIMESHEET PANEL (admin slide-in) -->
+    <div id="timesheet-overlay"></div>
+    <div id="timesheet-panel" class="panel hidden">
+      <div class="panel-header">
+        <span>EDIT TIMESHEET</span>
+        <button id="btn-timesheet-close">✕</button>
+      </div>
+
+      <section class="settings-section">
+        <label>Employee</label>
+        <select id="ts-employee" class="ts-select"></select>
+      </section>
+
+      <section class="settings-section">
+        <h3>WEEK</h3>
+        <div id="ts-week-nav">
+          <button id="ts-week-prev" class="ts-week-btn" title="Previous week">‹</button>
+          <span id="ts-week-label"></span>
+          <button id="ts-week-next" class="ts-week-btn" title="Next week">›</button>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>PUNCHES</h3>
+        <div id="ts-punch-list"></div>
+      </section>
+
+      <section class="settings-section">
+        <h3>ADD A PUNCH</h3>
+        <label>Date &amp; time</label>
+        <input id="ts-add-datetime" type="datetime-local">
+        <label>Type</label>
+        <select id="ts-add-type" class="ts-select">
+          <option value="CLOCK_IN">Clock In</option>
+          <option value="CLOCK_OUT">Clock Out</option>
+          <option value="LUNCH_START">Lunch Start</option>
+          <option value="LUNCH_END">Lunch End</option>
+        </select>
+        <button id="ts-add-btn" class="btn-secondary">ADD PUNCH</button>
       </section>
     </div>
 

@@ -21,6 +21,8 @@ function doPost(e) {
     if      (action === 'punch')                  result = handlePunch(data);
     else if (action === 'punchBatch')             result = handlePunchBatch(data);
     else if (action === 'exportWeek')             result = handleExportWeek(data);
+    else if (action === 'updatePunch')            result = handleUpdatePunch(data);
+    else if (action === 'deletePunch')            result = handleDeletePunch(data);
     else if (action === 'emailApproval')          result = handleEmailApprovalPost(data);
     else if (action === 'getPendingApprovals')    result = handleGetPendingApprovals();
     else if (action === 'markApprovalProcessed')  result = handleMarkApprovalProcessed(data);
@@ -84,16 +86,68 @@ function handlePunch(punch) {
   return { ok: true };
 }
 
+// Upsert by id: punches with a known id update their row, new ones append.
+// Idempotent — re-syncing the same punch never creates a duplicate.
 function handlePunchBatch(punches) {
   if (!punches || !punches.length) return { ok: true, synced: 0 };
   var ss    = SpreadsheetApp.openById(SHEET_ID);
   var sheet = getOrCreateSheet(ss, 'Punches',
     ['timestamp', 'employee', 'type', 'note', 'id']);
-  var rows  = punches.map(function(p) {
-    return [p.timestamp, p.employee, p.type, p.note || '', p.id || ''];
+
+  var data    = sheet.getDataRange().getValues();
+  var iId     = data[0].indexOf('id');
+  var rowById = {};
+  for (var r = 1; r < data.length; r++) {
+    if (data[r][iId]) rowById[data[r][iId]] = r + 1;
+  }
+
+  var appends = [];
+  punches.forEach(function(p) {
+    var vals = [p.timestamp, p.employee, p.type, p.note || '', p.id || ''];
+    if (p.id && rowById[p.id]) {
+      sheet.getRange(rowById[p.id], 1, 1, 5).setValues([vals]);
+    } else {
+      appends.push(vals);
+    }
   });
-  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 5).setValues(rows);
+  if (appends.length) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, appends.length, 5).setValues(appends);
+  }
   return { ok: true, synced: punches.length };
+}
+
+// Update a single punch by id (used by the admin timesheet editor).
+// Appends the punch if its id is not found.
+function handleUpdatePunch(p) {
+  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = getOrCreateSheet(ss, 'Punches',
+    ['timestamp', 'employee', 'type', 'note', 'id']);
+  var data  = sheet.getDataRange().getValues();
+  var iId   = data[0].indexOf('id');
+  var vals  = [p.timestamp, p.employee, p.type, p.note || '', p.id || ''];
+  for (var r = 1; r < data.length; r++) {
+    if (data[r][iId] && data[r][iId] === p.id) {
+      sheet.getRange(r + 1, 1, 1, 5).setValues([vals]);
+      return { ok: true, updated: true };
+    }
+  }
+  sheet.appendRow(vals);
+  return { ok: true, appended: true };
+}
+
+// Delete a single punch by id (used by the admin timesheet editor).
+function handleDeletePunch(p) {
+  var ss    = SpreadsheetApp.openById(SHEET_ID);
+  var sheet = ss.getSheetByName('Punches');
+  if (!sheet) return { ok: true };
+  var data  = sheet.getDataRange().getValues();
+  var iId   = data[0].indexOf('id');
+  for (var r = data.length - 1; r >= 1; r--) {
+    if (data[r][iId] && data[r][iId] === p.id) {
+      sheet.deleteRow(r + 1);
+    }
+  }
+  return { ok: true };
 }
 
 function handleExportWeek(rows) {
