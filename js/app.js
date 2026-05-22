@@ -1,7 +1,11 @@
-// DnK Time Clock — app.js v2.0
+// DnK Time Clock — app.js v2.1
 // Backend: Google Apps Script web app (no OAuth / no Google login required)
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
+
+// Apps Script web-app endpoint — the single source of truth.
+// Hardcoded so the app can never drift to a stale or wrong deployment URL.
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbwVdY1B5KtM0_CVpJNcbk6dtBBSk5ULPnwDk-dFE1hFF5rBJOLNLvjsUL1iove23p4tiQ/exec';
 
 const STORAGE_KEYS = {
   EMPLOYEES: 'dnk_employees',
@@ -71,9 +75,7 @@ function saveSettings(s) {
 // Uses text/plain content-type to avoid CORS preflight on GAS web app endpoints
 
 async function gasRequest(action, data) {
-  const { gasUrl } = getSettings();
-  if (!gasUrl) throw new Error('Apps Script URL not configured in Settings');
-  const resp = await fetch(gasUrl, {
+  const resp = await fetch(GAS_URL, {
     method:  'POST',
     headers: { 'Content-Type': 'text/plain' }, // avoids CORS preflight
     body:    JSON.stringify({ action, data })
@@ -433,13 +435,8 @@ function renderPayrollScreen() {
 }
 
 function renderSettingsValues() {
-  const s       = getSettings();
-  document.getElementById('input-gas-url').value = s.gasUrl || '';
-
   const unsynced = getPunches().filter(p => !p.synced).length;
-  if (!s.gasUrl) {
-    updateSheetStatus('Not configured — punches saved locally');
-  } else if (unsynced > 0) {
+  if (unsynced > 0) {
     updateSheetStatus(`${unsynced} punch${unsynced > 1 ? 'es' : ''} pending sync`);
   } else {
     updateSheetStatus('✓ All punches synced');
@@ -538,9 +535,6 @@ async function handleExportWeek() {
   const rows = calcWeeklyPayroll();
   if (!rows.length) { alert('No payroll data to export.'); return; }
 
-  const { gasUrl } = getSettings();
-  if (!gasUrl) { alert('Configure the Apps Script URL in Settings first.'); return; }
-
   const btn = document.getElementById('btn-export-week');
   btn.disabled = true; btn.textContent = 'EXPORTING…';
   try {
@@ -614,14 +608,6 @@ function init() {
   // Bottom nav
   document.querySelectorAll('.nav-btn').forEach(btn => {
     btn.addEventListener('click', () => switchScreen(btn.dataset.screen));
-  });
-
-  // GAS URL input
-  document.getElementById('input-gas-url').addEventListener('change', e => {
-    const s  = getSettings();
-    s.gasUrl = e.target.value.trim();
-    saveSettings(s);
-    renderSettingsValues();
   });
 
   // Sync offline punches

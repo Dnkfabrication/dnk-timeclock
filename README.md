@@ -11,39 +11,29 @@ Shop time clock for DnK Fabrication. Mobile-first, works offline, syncs to Googl
 
 ---
 
-## Google Sheets Setup (optional — required for payroll export)
+## Google Sheets Sync
 
-### 1. Create the Google Sheet
+The app syncs punches and payroll to a Google Sheet through a Google Apps
+Script web app. This is already set up — there is nothing to configure.
 
-1. Go to [sheets.google.com](https://sheets.google.com) and create a new spreadsheet
-2. Name it **DnK Time Clock**
-3. Copy the Sheet ID from the URL:
-   `https://docs.google.com/spreadsheets/d/`**THIS_IS_THE_ID**`/edit`
-4. Paste the Sheet ID into the app: gear icon → GOOGLE SHEETS → Sheet ID
-5. The app will automatically create **Punches** and **Weekly** tabs on first sync
+- **Spreadsheet:** "DnK Automation" (owned by dylan@dnkfabrication.com)
+- **Backend:** the Apps Script in `apps-script/Code.gs`, deployed as a web app
+- **Endpoint:** hardcoded as `GAS_URL` in `js/app.js` — the single source of truth
 
-### 2. Create an OAuth Client ID
+The app writes three tabs automatically: **Punches** (raw log), **Weekly**
+(payroll summaries, written on export), and **Approvals** (shared with the DnK
+social-post bot).
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project (or use an existing one)
-3. Enable the **Google Sheets API**:
-   APIs & Services → Enable APIs & Services → search "Google Sheets API" → Enable
-4. Create OAuth credentials:
-   APIs & Services → Credentials → Create Credentials → **OAuth 2.0 Client ID**
-5. Application type: **Web application**
-6. Name: `DnK Time Clock`
-7. Under **Authorized JavaScript origins**, add:
-   - `https://Dnkfabrication.github.io` (for GitHub Pages hosting)
-   - `http://localhost` (for local testing, if needed)
-8. Click **Create** → copy the **Client ID** (ends in `.apps.googleusercontent.com`)
-9. Paste the Client ID into the app: gear icon → GOOGLE SHEETS → OAuth Client ID
+### Re-deploying the backend
 
-### 3. Sign In
+If you edit `apps-script/Code.gs`, paste it into the Apps Script editor for the
+"DnK Time Clock" project, then **Deploy → Manage deployments → Edit → Deploy**
+to publish a new version. Keep the deploy settings as:
 
-1. Open the app → gear icon → tap **SIGN IN WITH GOOGLE**
-2. Sign in as `dylan@dnkfabrication.com`
-3. Auth status will change to **✓ Connected to Google Sheets**
-4. Any offline punches sync automatically after sign-in
+- **Execute as:** Me (dylan@dnkfabrication.com)
+- **Who has access:** Anyone
+
+If the `/exec` URL ever changes, update `GAS_URL` at the top of `js/app.js`.
 
 ---
 
@@ -69,7 +59,7 @@ The gear icon shows an orange dot when there are unsynced offline punches.
 
 The app works fully offline. All punches are saved to the browser's `localStorage` immediately.
 
-When you come back online and sign in to Google, tap **SYNC OFFLINE PUNCHES** to push any pending punches to the Google Sheet.
+When you come back online, open Settings and tap **SYNC OFFLINE PUNCHES** to push any pending punches to the Google Sheet.
 
 > **Important:** Punches are stored per-browser/device. If an employee clocks in on a different phone or computer, those punches live on that device. Sync to Sheets regularly to consolidate data across devices.
 
@@ -96,10 +86,9 @@ When you come back online and sign in to Google, tap **SYNC OFFLINE PUNCHES** to
 1. Push this folder to a GitHub repo (e.g., `Dnkfabrication/dnk-timeclock`)
 2. Repo Settings → Pages → Source: `main` branch, root `/`
 3. Site publishes at `https://Dnkfabrication.github.io/dnk-timeclock/`
-4. Make sure that origin is added to your OAuth Client ID's Authorized JavaScript origins
 
 ---
 
 ## Data & Privacy
 
-All time data stays in the browser's `localStorage` unless you explicitly export to Google Sheets. Nothing is sent to any third-party server. Google OAuth tokens are stored locally and expire after 1 hour, requiring re-authentication.
+All time data stays in the browser's `localStorage` until it syncs to Google Sheets. Sync goes only to your own Apps Script web app — no third-party servers are involved.
